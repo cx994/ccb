@@ -558,7 +558,15 @@ class OpenCodeLogReader:
 
         # If assistant is still streaming, wait (prefer completed reply).
         if completed_i is None:
-            return None
+            # Fallback: some OpenCode builds may omit completed timestamps.
+            # If the message already contains the completion marker, treat it as complete.
+            parts = self._read_parts(str(latest_id))
+            text = self._extract_text(parts)
+            completion_marker = (os.environ.get("CCB_EXECUTION_COMPLETE_MARKER") or "--- EXECUTION COMPLETE ---").strip() or "--- EXECUTION COMPLETE ---"
+            if text and completion_marker in text:
+                completed_i = int(time.time() * 1000)
+            else:
+                return None  # Still streaming, wait
 
         # Detect change via count or last id or completion timestamp.
         if len(assistants) <= prev_count and latest_id == prev_last and completed_i == prev_completed:
