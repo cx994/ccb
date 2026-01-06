@@ -1647,7 +1647,7 @@ def _update_cca(silent: bool = False) -> int:
             install_dir = Path.home() / "AppData/Local/cca"
     else:
         # Unix/Linux/macOS: 使用 ~/.local/share/claude_code_autoflow
-    install_dir = Path.home() / ".local/share/claude_code_autoflow"
+        install_dir = Path.home() / ".local/share/claude_code_autoflow"
     tarball_url = f"{cca_repo}/archive/refs/heads/main.tar.gz"
 
     try:
@@ -1684,8 +1684,8 @@ def _update_cca(silent: bool = False) -> int:
                         print(f"   Files extracted to: {install_dir}")
             else:
                 # Unix/Linux/macOS: 使用 install.sh
-            install_script = install_dir / "install.sh"
-            if install_script.exists():
+                install_script = install_dir / "install.sh"
+                if install_script.exists():
                     subprocess.run(["bash", str(install_script), "install"], cwd=str(install_dir))
                 else:
                     print("⚠️  install.sh not found")
