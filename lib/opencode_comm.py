@@ -571,17 +571,8 @@ class OpenCodeLogReader:
                 return None  # Still streaming, wait
 
         # Detect change via count or last id or completion timestamp.
+        # If nothing changed, no new reply yet - keep waiting.
         if len(assistants) <= prev_count and latest_id == prev_last and completed_i == prev_completed:
-            # Race condition fallback: if there's a completed reply with content, return it.
-            # This handles cases where capture_state() happened after OpenCode already replied,
-            # preventing the process from waiting indefinitely for a reply that already exists.
-            if completed_i is not None:
-                parts = self._read_parts(str(latest_id))
-                text = self._extract_text(parts, allow_reasoning_fallback=False)
-                if not text:
-                    text = self._extract_text(parts, allow_reasoning_fallback=True)
-                if text:
-                    return text
             return None
 
         parts = self._read_parts(str(latest_id))
