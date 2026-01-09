@@ -20,6 +20,7 @@ import tempfile
 import re
 import shutil
 import posixpath
+import shlex
 from pathlib import Path
 
 script_dir = Path(__file__).resolve().parent
@@ -216,6 +217,7 @@ class AILauncher:
         self._cleaned = False
         self.terminal_type = self._detect_terminal_type()
         self.tmux_sessions = {}
+        self.tmux_sessions_owned = {}
         self.wezterm_panes = {}
         self.iterm2_panes = {}
         self.processes = {}
@@ -273,6 +275,83 @@ class AILauncher:
         )
         return True
 
+    def _tmux_has_session(self, session: str) -> bool:
+        if not session:
+            return False
+        try:
+            result = subprocess.run(
+                ["tmux", "has-session", "-t", session],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return result.returncode == 0
+        except Exception:
+            return False
+
+    def _tmux_display(self, target: str, fmt: str) -> str:
+        if not target:
+            return ""
+        try:
+            result = subprocess.run(
+                ["tmux", "display-message", "-p", "-t", target, fmt],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode != 0:
+                return ""
+            return (result.stdout or "").strip()
+        except Exception:
+            return ""
+
+    def _tmux_list_sessions(self) -> list[str]:
+        try:
+            result = subprocess.run(
+                ["tmux", "list-sessions", "-F", "#{session_name}"],
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+            if result.returncode != 0:
+                return []
+            return [line.strip() for line in (result.stdout or "").splitlines() if line.strip()]
+        except Exception:
+            return []
+
+    def _find_reusable_codex_tmux_session(self) -> str | None:
+        """
+        Best-effort selection of an already-running Codex tmux session.
+        Preference:
+        1) `./.codex-session` 的 `tmux_session`（只要 tmux session 存在即可）
+        2) 任何名字看起来像 Codex 的 tmux session（session 名以 `codex` 开头）
+        """
+        try:
+            session_file = Path.cwd() / ".codex-session"
+            if session_file.exists():
+                data = self._read_json_file(session_file)
+                candidate = (data.get("tmux_session") or "").strip()
+                if candidate and self._tmux_has_session(candidate):
+                    return candidate
+        except Exception:
+            pass
+
+        sessions = [s for s in self._tmux_list_sessions() if s.lower().startswith("codex")]
+        sessions.sort()
+        return sessions[0] if sessions else None
+
+    def _terminate_pid_file(self, pid_file: Path, *, sig: int = signal.SIGTERM) -> None:
+        try:
+            if not pid_file.exists():
+                return
+            pid_raw = pid_file.read_text(encoding="utf-8", errors="ignore").strip()
+            if not pid_raw.isdigit():
+                return
+            os.kill(int(pid_raw), sig)
+        except Exception:
+            return
+
     def _start_provider(self, provider: str) -> bool:
         # Handle case when no terminal detected
         if self.terminal_type is None:
@@ -303,19 +382,30 @@ class AILauncher:
                 return False
 
         print(f"🚀 {t('starting_backend', provider=provider.capitalize(), terminal='tmux')}")
+        tmux_session = ""
+        owned = True
 
-        tmux_session = f"{provider}-{int(time.time()) % 100000}-{os.getpid()}"
+        if provider == "codex":
+            reusable = self._find_reusable_codex_tmux_session()
+            if reusable:
+                tmux_session = reusable
+                owned = False
+            else:
+                tmux_session = f"{provider}-{int(time.time()) % 100000}-{os.getpid()}"
+        else:
+            tmux_session = f"{provider}-{int(time.time()) % 100000}-{os.getpid()}"
+
         self.tmux_sessions[provider] = tmux_session
+        self.tmux_sessions_owned[provider] = owned
 
         if provider == "codex":
             return self._start_codex(tmux_session)
-        elif provider == "gemini":
+        if provider == "gemini":
             return self._start_gemini(tmux_session)
-        elif provider == "opencode":
+        if provider == "opencode":
             return self._start_opencode(tmux_session)
-        else:
-            print(f"❌ {t('unknown_provider', provider=provider)}")
-            return False
+        print(f"❌ {t('unknown_provider', provider=provider)}")
+        return False
 
     def _start_provider_wezterm(self, provider: str) -> bool:
         runtime = self.runtime_dir / provider
@@ -753,57 +843,67 @@ class AILauncher:
 
         start_cmd = self._build_codex_start_cmd()
 
+        # If a previous codex bridge exists for this cwd, stop it before starting a new one.
+        try:
+            session_file = Path.cwd() / ".codex-session"
+            if session_file.exists():
+                prev = self._read_json_file(session_file)
+                prev_runtime = (prev.get("runtime_dir") or "").strip()
+                if prev_runtime and prev_runtime != str(runtime):
+                    self._terminate_pid_file(Path(prev_runtime).expanduser() / "bridge.pid")
+        except Exception:
+            pass
+
+        # Ensure the tmux session exists. If it already exists, do NOT inject the start
+        # command (could corrupt an existing interactive session). Reuse as-is.
+        if not self._tmux_has_session(tmux_session):
+            subprocess.run(
+                ["tmux", "new-session", "-d", "-s", tmux_session, "-c", os.getcwd(), start_cmd],
+                check=True,
+            )
+
+        # Persist a best-effort codex PID (tmux pane pid) for diagnostics.
+        pane_pid = self._tmux_display(tmux_session, "#{pane_pid}")
+        if pane_pid.isdigit():
+            try:
+                (runtime / "codex.pid").write_text(pane_pid + "\n", encoding="utf-8")
+            except Exception:
+                pass
+
+        # Optional: pipe pane output to a local log for debugging.
+        tmux_log = runtime / "bridge_output.log"
+        try:
+            tmux_cmd = f"cat >> {shlex.quote(str(tmux_log))}"
+            subprocess.run(["tmux", "pipe-pane", "-o", "-t", tmux_session, tmux_cmd], stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
+
+        # Start bridge as a background process (do NOT rely on tmux attach in detached sessions).
         bridge_script = self.script_dir / "lib" / "codex_dual_bridge.py"
-        wrapper = f'''#!/bin/bash
-SESSION_ID="{self.session_id}"
-RUNTIME_DIR="{runtime}"
-TMUX_SESSION="{tmux_session}"
-BRIDGE_SCRIPT="{bridge_script}"
-PYTHON_BIN="{sys.executable}"
-SCRIPT_DIR="{self.script_dir}"
-WORK_DIR="{os.getcwd()}"
-INPUT_FIFO="{input_fifo}"
-OUTPUT_FIFO="{output_fifo}"
-TMUX_LOG_FILE="{runtime}/bridge_output.log"
-
-echo $$ > "$RUNTIME_DIR/codex.pid"
-export PYTHONPATH="$SCRIPT_DIR:${{PYTHONPATH:-}}"
-export CODEX_SESSION_ID="$SESSION_ID"
-export CODEX_RUNTIME_DIR="$RUNTIME_DIR"
-export CODEX_INPUT_FIFO="$INPUT_FIFO"
-export CODEX_OUTPUT_FIFO="$OUTPUT_FIFO"
-export CODEX_TMUX_SESSION="$TMUX_SESSION"
-export CODEX_TMUX_LOG="$TMUX_LOG_FILE"
-
-CODEX_START_CMD={json.dumps(start_cmd)}
-
-if ! tmux has-session -t "$TMUX_SESSION" 2>/dev/null; then
-    cd "$WORK_DIR"
-    tmux new-session -d -s "$TMUX_SESSION" "$CODEX_START_CMD"
-fi
-tmux pipe-pane -o -t "$TMUX_SESSION" "cat >> '$TMUX_LOG_FILE'"
-
-"$PYTHON_BIN" "$BRIDGE_SCRIPT" --runtime-dir "$RUNTIME_DIR" --session-id "$SESSION_ID" >>"$RUNTIME_DIR/bridge.log" 2>&1 &
-BRIDGE_PID=$!
-echo $BRIDGE_PID > "$RUNTIME_DIR/bridge.pid"
-
-trap 'kill -TERM "$BRIDGE_PID" 2>/dev/null' EXIT
-exec tmux attach -t "$TMUX_SESSION"
-'''
-        script_file = runtime / "wrapper.sh"
-        script_file.write_text(wrapper)
-        os.chmod(script_file, 0o755)
+        bridge_log = runtime / "bridge.log"
+        env = os.environ.copy()
+        env["CODEX_TERMINAL"] = "tmux"
+        env["CODEX_TMUX_SESSION"] = tmux_session
+        try:
+            with bridge_log.open("a", encoding="utf-8") as handle:
+                proc = subprocess.Popen(
+                    [sys.executable, str(bridge_script), "--runtime-dir", str(runtime), "--session-id", self.session_id],
+                    stdout=handle,
+                    stderr=subprocess.STDOUT,
+                    env=env,
+                    cwd=os.getcwd(),
+                    start_new_session=True,
+                )
+            try:
+                (runtime / "bridge.pid").write_text(str(proc.pid) + "\n", encoding="utf-8")
+            except Exception:
+                pass
+            self.processes["codex_bridge"] = proc
+        except Exception as exc:
+            print(f"❌ Failed to start Codex bridge: {exc}", file=sys.stderr)
+            return False
 
         self._write_codex_session(runtime, tmux_session, input_fifo, output_fifo)
-
-        terminal = self._detect_launch_terminal()
-        if terminal == "tmux":
-            if self._launch_script_in_macos_terminal(script_file):
-                pass
-            else:
-                subprocess.run(["tmux", "new-session", "-d", "-s", f"launcher-{tmux_session}", str(script_file)], check=True)
-        else:
-            subprocess.Popen([terminal, "-e", str(script_file)])
 
         print(f"✅ {t('started_backend', provider='Codex', terminal='tmux', pane_id=tmux_session)}")
         return True
@@ -1182,6 +1282,34 @@ exec tmux attach -t "$TMUX_SESSION"
         self._cleaned = True
         print(f"\n🧹 {t('cleaning_up')}")
 
+        # Stop background bridge processes we started (best-effort).
+        try:
+            proc = self.processes.get("codex_bridge")
+            if proc and getattr(proc, "poll", None) and proc.poll() is None:
+                try:
+                    proc.terminate()
+                    proc.wait(timeout=2.0)
+                except Exception:
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
+        # Fallback: if codex bridge pid file exists, attempt to terminate it before removing runtime dir.
+        try:
+            bridge_pid_file = (self.runtime_dir / "codex" / "bridge.pid")
+            if bridge_pid_file.exists():
+                pid_raw = bridge_pid_file.read_text(encoding="utf-8", errors="ignore").strip()
+                if pid_raw.isdigit():
+                    try:
+                        os.kill(int(pid_raw), signal.SIGTERM)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+
         if self.terminal_type == "wezterm":
             backend = WeztermBackend()
             for provider, pane_id in self.wezterm_panes.items():
@@ -1194,6 +1322,8 @@ exec tmux attach -t "$TMUX_SESSION"
                     backend.kill_pane(pane_id)
         else:
             for provider, tmux_session in self.tmux_sessions.items():
+                if not self.tmux_sessions_owned.get(provider, True):
+                    continue
                 subprocess.run(["tmux", "kill-session", "-t", tmux_session], stderr=subprocess.DEVNULL)
                 subprocess.run(["tmux", "kill-session", "-t", f"launcher-{tmux_session}"], stderr=subprocess.DEVNULL)
 
@@ -1336,6 +1466,21 @@ def cmd_kill(args):
             data = json.loads(session_file.read_text(encoding="utf-8-sig"))
             terminal = data.get("terminal", "tmux")
             pane_id = data.get("pane_id") if terminal in ("wezterm", "iterm2") else data.get("tmux_session", "")
+
+            # Best-effort: stop background bridge process (tmux codex) if present.
+            if provider == "codex":
+                try:
+                    runtime_dir = Path(data.get("runtime_dir", "")).expanduser()
+                    bridge_pid_file = runtime_dir / "bridge.pid"
+                    if bridge_pid_file.exists():
+                        pid_raw = bridge_pid_file.read_text(encoding="utf-8", errors="ignore").strip()
+                        if pid_raw.isdigit():
+                            try:
+                                os.kill(int(pid_raw), signal.SIGTERM)
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
 
             if terminal == "wezterm" and pane_id:
                 backend = WeztermBackend()
