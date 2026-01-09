@@ -1,6 +1,6 @@
 <div align="center">
 
-# Claude Code Bridge (ccb) v2.3
+# Claude Code Bridge (ccb) v3.0.0
 
 **基于终端分屏的 Claude & Codex & Gemini 丝滑协作工具**
 
@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/Every_Model_Controllable-CF1322?style=for-the-badge" alt="Every Model Controllable">
 </p>
 
-[![Version](https://img.shields.io/badge/version-2.3-orange.svg)]()
+[![Version](https://img.shields.io/badge/version-3.0.0-orange.svg)]()
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
 
 [English](README.md) | **中文**
@@ -36,6 +36,82 @@
 | **🧠 持久上下文** | 每个 AI 独立记忆，关闭后可随时恢复（`-r` 参数）。 |
 | **📉 节省 Token** | 仅发送轻量级指令，而非整个代码库历史 (~20k tokens)。 |
 | **🪟 原生终端体验** | 直接集成于 **WezTerm** (推荐) 或 tmux，无需配置复杂的服务器。 |
+
+---
+
+<h2 align="center">🚀 v3.0 新版本特性</h2>
+
+> **跨 AI 协作的终极桥梁**
+
+v3.0 带来了革命性的 **智能守护进程 (Smart Daemons)** 架构，实现了并行执行、跨 Agent 协调和企业级稳定性。
+
+<div align="center">
+
+![Parallel](https://img.shields.io/badge/Strategy-Parallel_Queue-blue?style=flat-square)
+![Stability](https://img.shields.io/badge/Daemon-Auto_Managed-green?style=flat-square)
+![Interruption](https://img.shields.io/badge/Gemini-Interruption_Aware-orange?style=flat-square)
+
+</div>
+
+<h3 align="center">✨ 核心特性</h3>
+
+- **🔄 真·并行**: 同时提交多个任务给 Codex、Gemini 或 OpenCode。新的守护进程 (`caskd`, `gaskd`, `oaskd`) 会自动将它们排队并串行执行，确保上下文不被污染。
+- **🤝 跨 AI 编排**: Claude 和 Codex 现在可以同时驱动 OpenCode Agent。所有请求都由统一的守护进程层仲裁。
+- **🛡️ 坚如磐石**: 守护进程自我管理——首个请求自动启动，空闲 60 秒后自动关闭以节省资源。
+- **⚡ 链式调用**: 支持高级工作流！Codex 可以自主调用 `oask` 将子任务委派给 OpenCode 模型。
+- **🛑 智能打断**: Gemini 任务支持智能打断检测，自动处理停止信号并确保工作流连续性。
+
+<h3 align="center">🧩 功能支持矩阵</h3>
+
+| 特性 | `caskd` (Codex) | `gaskd` (Gemini) | `oaskd` (OpenCode) |
+| :--- | :---: | :---: | :---: |
+| **并行队列** | ✅ | ✅ | ✅ |
+| **打断感知** | ✅ | ✅ | - |
+| **响应隔离** | ✅ | ✅ | ✅ |
+
+<details>
+<summary><strong>📊 查看真实压力测试结果</strong></summary>
+
+<br>
+
+**场景 1: Claude & Codex 同时访问 OpenCode**
+*两个 Agent 同时发送请求，由守护进程完美协调。*
+
+| 来源 | 任务 | 结果 | 状态 |
+| :--- | :--- | :--- | :---: |
+| 🤖 Claude | `CLAUDE-A` | **CLAUDE-A** | 🟢 |
+| 🤖 Claude | `CLAUDE-B` | **CLAUDE-B** | 🟢 |
+| 💻 Codex | `CODEX-A` | **CODEX-A** | 🟢 |
+| 💻 Codex | `CODEX-B` | **CODEX-B** | 🟢 |
+
+**场景 2: 递归/链式调用**
+*Codex 自主驱动 OpenCode 执行 5 步工作流。*
+
+| 请求 | 退出码 | 响应 |
+| :--- | :---: | :--- |
+| **ONE** | `0` | `CODEX-ONE` |
+| **TWO** | `0` | `CODEX-TWO` |
+| **THREE** | `0` | `CODEX-THREE` |
+| **FOUR** | `0` | `CODEX-FOUR` |
+| **FIVE** | `0` | `CODEX-FIVE` |
+
+</details>
+
+---
+
+<h3 align="center">🧠 介绍 CCA (Claude Code Autoflow)</h3>
+
+释放 `ccb` 的全部潜力 —— **CCA** 是基于本桥接工具构建的高级工作流自动化系统。
+
+*   **工作流自动化**: 智能任务分配和自动化状态管理。
+*   **无缝集成**: 原生支持 v3.0 守护进程架构。
+
+[👉 在 GitHub 上查看项目](https://github.com/bfly123/claude_code_autoflow)
+
+**通过 CCB 安装:**
+```bash
+ccb update cca
+```
 
 ---
 
@@ -330,17 +406,12 @@ echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zprofile
 
 ---
 
-<div align="center">
+<details>
+<summary><b>更新历史</b></summary>
 
-**Windows 完全支持** (WSL + 原生 Windows 均通过 WezTerm)
-
----
-
-**测试用户群，欢迎加入**
-
-📧 Email: bfly123@126.com
-💬 WeChat: seemseam-com
-
-<img src="assets/weixin.png" alt="微信群" width="300">
-
-</div>
+### v3.0.0
+- **智能守护进程**: `caskd`/`gaskd`/`oaskd` 支持 60秒空闲超时和并行队列
+- **跨 AI 协作**: 支持多个 Agent (Claude/Codex) 同时调用同一个 Agent (OpenCode)
+- **打断检测**: Gemini 现在支持智能打断处理
+- **链式执行**: Codex 可以调用 `oask` 驱动 OpenCode
+- **稳定性**: 健壮的队列管理和锁文件机制

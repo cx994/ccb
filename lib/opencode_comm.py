@@ -14,14 +14,18 @@ import re
 import shutil
 import sys
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
+from caskd_protocol import REQ_ID_PREFIX
 from ccb_config import apply_backend_env
 from i18n import t
 from terminal import get_backend_for_session, get_pane_id_from_session
 
 apply_backend_env()
+
+_REQ_ID_RE = re.compile(rf"{re.escape(REQ_ID_PREFIX)}\s*([0-9a-fA-F]{{32}})")
 
 
 def compute_opencode_project_id(work_dir: Path) -> str:
@@ -92,6 +96,8 @@ def compute_opencode_project_id(work_dir: Path) -> str:
             ["git", "rev-list", "--max-parents=0", "--all"],
             cwd=str(git_root or cwd),
             text=True,
+            encoding="utf-8",
+            errors="replace",
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             check=False,
@@ -217,6 +223,76 @@ def _default_opencode_storage_root() -> Path:
 
 OPENCODE_STORAGE_ROOT = _default_opencode_storage_root()
 
+def _default_opencode_log_root() -> Path:
+    env = (os.environ.get("OPENCODE_LOG_ROOT") or "").strip()
+    if env:
+        return Path(env).expanduser()
+
+    candidates: list[Path] = []
+    xdg_data_home = (os.environ.get("XDG_DATA_HOME") or "").strip()
+    if xdg_data_home:
+        candidates.append(Path(xdg_data_home) / "opencode" / "log")
+    candidates.append(Path.home() / ".local" / "share" / "opencode" / "log")
+    candidates.append(Path.home() / ".opencode" / "log")
+
+    for candidate in candidates:
+        try:
+            if candidate.exists():
+                return candidate
+        except Exception:
+            continue
+
+    return candidates[0]
+
+
+OPENCODE_LOG_ROOT = _default_opencode_log_root()
+
+
+def _latest_opencode_log_file(root: Path = OPENCODE_LOG_ROOT) -> Path | None:
+    try:
+        if not root.exists():
+            return None
+        paths = [p for p in root.glob("*.log") if p.is_file()]
+    except Exception:
+        return None
+    if not paths:
+        return None
+    try:
+        paths.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    except Exception:
+        paths.sort()
+    return paths[0]
+
+
+def _is_cancel_log_line(line: str, *, session_id: str) -> bool:
+    if not line:
+        return False
+    sid = (session_id or "").strip()
+    if not sid:
+        return False
+    if f"sessionID={sid} cancel" in line:
+        return True
+    if f"path=/session/{sid}/abort" in line:
+        return True
+    return False
+
+
+def _parse_opencode_log_epoch_s(line: str) -> float | None:
+    """
+    Parse OpenCode log timestamp into epoch seconds (UTC).
+
+    Observed format: "INFO  2026-01-09T12:11:12 +1ms service=..."
+    """
+    try:
+        parts = (line or "").split()
+        if len(parts) < 2:
+            return None
+        ts = parts[1]
+        dt = datetime.strptime(ts, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+        return float(dt.timestamp())
+    except Exception:
+        return None
+
 
 class OpenCodeLogReader:
     """
@@ -228,12 +304,20 @@ class OpenCodeLogReader:
       storage/part/<messageID>/prt_*.json
     """
 
-    def __init__(self, root: Path = OPENCODE_STORAGE_ROOT, work_dir: Optional[Path] = None, project_id: str = "global"):
+    def __init__(
+        self,
+        root: Path = OPENCODE_STORAGE_ROOT,
+        work_dir: Optional[Path] = None,
+        project_id: str = "global",
+        *,
+        session_id_filter: str | None = None,
+    ):
         self.root = Path(root).expanduser()
         self.work_dir = work_dir or Path.cwd()
         env_project_id = (os.environ.get("OPENCODE_PROJECT_ID") or "").strip()
         explicit_project_id = bool(env_project_id) or ((project_id or "").strip() not in ("", "global"))
         self.project_id = (env_project_id or project_id or "global").strip() or "global"
+        self._session_id_filter = (session_id_filter or "").strip() or None
         if not explicit_project_id:
             detected = self._detect_project_id_for_workdir()
             if detected:
@@ -359,6 +443,18 @@ class OpenCodeLogReader:
         sessions_dir = self._session_dir()
         if not sessions_dir.exists():
             return None
+
+        if self._session_id_filter:
+            try:
+                for path in sessions_dir.glob("ses_*.json"):
+                    if not path.is_file():
+                        continue
+                    payload = self._load_json(path)
+                    sid = payload.get("id")
+                    if isinstance(sid, str) and sid == self._session_id_filter:
+                        return {"path": path, "payload": payload}
+            except Exception:
+                pass
 
         candidates = self._work_dir_candidates()
         best_match: dict | None = None
@@ -565,7 +661,8 @@ class OpenCodeLogReader:
             parts = self._read_parts(str(latest_id))
             text = self._extract_text(parts, allow_reasoning_fallback=False)
             completion_marker = (os.environ.get("CCB_EXECUTION_COMPLETE_MARKER") or "[EXECUTION_COMPLETE]").strip() or "[EXECUTION_COMPLETE]"
-            if text and completion_marker in text:
+            has_done = bool(text) and ("CCB_DONE:" in text)
+            if text and (completion_marker in text or has_done):
                 completed_i = int(time.time() * 1000)
             else:
                 return None  # Still streaming, wait
@@ -679,6 +776,193 @@ class OpenCodeLogReader:
         parts = self._read_parts(str(latest.get("id")))
         text = self._extract_text(parts)
         return text or None
+
+    @staticmethod
+    def _is_aborted_error(error_obj: object) -> bool:
+        if not isinstance(error_obj, dict):
+            return False
+        name = error_obj.get("name")
+        if isinstance(name, str) and "aborted" in name.lower():
+            return True
+        data = error_obj.get("data")
+        if isinstance(data, dict):
+            msg = data.get("message")
+            if isinstance(msg, str) and ("aborted" in msg.lower() or "cancel" in msg.lower()):
+                return True
+        return False
+
+    @staticmethod
+    def _extract_req_id_from_text(text: str) -> Optional[str]:
+        if not text:
+            return None
+        m = _REQ_ID_RE.search(text)
+        return m.group(1).lower() if m else None
+
+    def detect_cancelled_since(self, state: Dict[str, Any], *, req_id: str) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Detect whether the request with `req_id` was cancelled/aborted.
+
+        Observed OpenCode cancellation behavior:
+        - A new assistant message is written with an `error` like:
+          {"name":"MessageAbortedError","data":{"message":"The operation was aborted."}}
+        - That assistant message contains no text parts, so naive reply polling misses it.
+        """
+        req_id = (req_id or "").strip().lower()
+        if not req_id:
+            return False, state
+
+        try:
+            prev_count = int(state.get("assistant_count") or 0)
+        except Exception:
+            prev_count = 0
+        prev_last = state.get("last_assistant_id")
+        prev_completed = state.get("last_assistant_completed")
+
+        new_state = self.capture_state()
+        session_id = new_state.get("session_id")
+        if not isinstance(session_id, str) or not session_id:
+            return False, new_state
+
+        messages = self._read_messages(session_id)
+        assistants = [m for m in messages if m.get("role") == "assistant" and isinstance(m.get("id"), str)]
+        by_id: dict[str, dict] = {str(m.get("id")): m for m in assistants if isinstance(m.get("id"), str)}
+
+        candidates: list[dict] = []
+        if prev_count < len(assistants):
+            candidates.extend(assistants[prev_count:])
+
+        # Cancellation can be recorded by updating an existing in-flight assistant message in-place
+        # (assistant_count unchanged). Always inspect the latest assistant message, and also inspect the
+        # previous last assistant message when its completed timestamp changed.
+        last_id = new_state.get("last_assistant_id")
+        if isinstance(last_id, str) and last_id in by_id and by_id[last_id] not in candidates:
+            candidates.append(by_id[last_id])
+        if (
+            isinstance(prev_last, str)
+            and prev_last in by_id
+            and prev_last != last_id
+            and by_id[prev_last] not in candidates
+        ):
+            # Include the previous last assistant too (rare session switching / reordering).
+            candidates.append(by_id[prev_last])
+        if (
+            isinstance(prev_last, str)
+            and prev_last in by_id
+            and prev_last == last_id
+            and by_id[prev_last] not in candidates
+            and new_state.get("last_assistant_completed") != prev_completed
+        ):
+            candidates.append(by_id[prev_last])
+
+        if not candidates:
+            return False, new_state
+
+        for msg in candidates:
+            if not self._is_aborted_error(msg.get("error")):
+                continue
+            parent_id = msg.get("parentID")
+            if not isinstance(parent_id, str) or not parent_id:
+                continue
+            parts = self._read_parts(parent_id)
+            prompt_text = self._extract_text(parts, allow_reasoning_fallback=True)
+            prompt_req_id = self._extract_req_id_from_text(prompt_text)
+            if prompt_req_id and prompt_req_id == req_id:
+                return True, new_state
+
+        return False, new_state
+
+    def open_cancel_log_cursor(self) -> Dict[str, Any]:
+        """
+        Create a cursor that tails OpenCode's server logs for cancellation/abort events.
+
+        The cursor starts at EOF so only future lines are considered.
+        """
+        path = _latest_opencode_log_file()
+        if not path:
+            return {"path": None, "offset": 0}
+        try:
+            offset = int(path.stat().st_size)
+        except Exception:
+            offset = 0
+        return {"path": str(path), "offset": offset, "mtime": float(path.stat().st_mtime) if path.exists() else 0.0}
+
+    def detect_cancel_event_in_logs(
+        self, cursor: Dict[str, Any], *, session_id: str, since_epoch_s: float
+    ) -> Tuple[bool, Dict[str, Any]]:
+        """
+        Detect cancellation based on OpenCode log lines.
+
+        This is a fallback for the race where the user interrupts before the prompt/aborted message
+        is persisted into storage.
+        """
+        if not isinstance(cursor, dict):
+            cursor = {}
+        current_path = cursor.get("path")
+        offset = cursor.get("offset")
+        cursor_mtime = cursor.get("mtime")
+        try:
+            offset_i = int(offset) if offset is not None else 0
+        except Exception:
+            offset_i = 0
+        try:
+            cursor_mtime_f = float(cursor_mtime) if cursor_mtime is not None else 0.0
+        except Exception:
+            cursor_mtime_f = 0.0
+
+        latest = _latest_opencode_log_file()
+        if latest is None:
+            return False, {"path": None, "offset": 0, "mtime": 0.0}
+
+        path = Path(str(current_path)) if isinstance(current_path, str) and current_path else None
+        if path is None or not path.exists():
+            path = latest
+            offset_i = 0
+            cursor_mtime_f = 0.0
+        elif latest != path:
+            # Prefer staying on the same file unless the latest file is clearly newer than our cursor.
+            try:
+                latest_mtime = float(latest.stat().st_mtime)
+            except Exception:
+                latest_mtime = 0.0
+            if latest_mtime > cursor_mtime_f + 0.5:
+                path = latest
+                offset_i = 0
+                cursor_mtime_f = 0.0
+
+        try:
+            size = int(path.stat().st_size)
+        except Exception:
+            return False, {"path": str(path), "offset": 0, "mtime": cursor_mtime_f}
+
+        if offset_i < 0 or offset_i > size:
+            offset_i = 0
+
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                handle.seek(offset_i)
+                chunk = handle.read()
+        except Exception:
+            return False, {"path": str(path), "offset": size, "mtime": cursor_mtime_f}
+
+        try:
+            new_cursor_mtime = float(path.stat().st_mtime)
+        except Exception:
+            new_cursor_mtime = cursor_mtime_f
+        new_cursor = {"path": str(path), "offset": size, "mtime": new_cursor_mtime}
+        if not chunk:
+            return False, new_cursor
+
+        for line in chunk.splitlines():
+            if not _is_cancel_log_line(line, session_id=session_id):
+                continue
+            ts = _parse_opencode_log_epoch_s(line)
+            if ts is None:
+                continue
+            if ts + 0.1 < float(since_epoch_s):
+                continue
+            return True, new_cursor
+
+        return False, new_cursor
 
 
 class OpenCodeCommunicator:

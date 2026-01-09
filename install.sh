@@ -90,14 +90,17 @@ fi
 SCRIPTS_TO_LINK=(
   bin/cask
   bin/cask-w
+  bin/caskd
   bin/cpend
   bin/cping
   bin/gask
   bin/gask-w
+  bin/gaskd
   bin/gpend
   bin/gping
   bin/oask
   bin/oask-w
+  bin/oaskd
   bin/opend
   bin/oping
   bin/ccb-layout
