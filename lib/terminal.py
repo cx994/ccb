@@ -255,7 +255,10 @@ class Iterm2Backend(TerminalBackend):
         try:
             result = subprocess.run(
                 [self._bin(), "session", "list", "--json"],
-                capture_output=True, text=True
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
             if result.returncode != 0:
                 return False

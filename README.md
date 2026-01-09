@@ -1,6 +1,6 @@
 <div align="center">
 
-# Claude Code Bridge (ccb) v2.3.9
+# Claude Code Bridge (ccb) v3.0.0
 
 **Silky Smooth Claude & Codex & Gemini Collaboration via Split-Pane Terminal**
 
@@ -15,7 +15,7 @@
   <img src="https://img.shields.io/badge/Every_Model_Controllable-CF1322?style=for-the-badge" alt="Every Model Controllable">
 </p>
 
-[![Version](https://img.shields.io/badge/version-2.3.9-orange.svg)]()
+[![Version](https://img.shields.io/badge/version-3.0.0-orange.svg)]()
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 [![Platform](https://img.shields.io/badge/platform-Linux%20%7C%20macOS%20%7C%20Windows-lightgrey.svg)]()
@@ -38,6 +38,82 @@
 | **🧠 Persistent Context** | Each AI maintains its own memory. Close and resume anytime (`-r` flag). |
 | **📉 Token Savings** | Sends lightweight prompts instead of full file history. |
 | **🪟 Native Workflow** | Integrates directly into **WezTerm** (recommended) or tmux. No complex servers required. |
+
+---
+
+<h2 align="center">🚀 What's New in v3.0</h2>
+
+> **The Ultimate Bridge for Cross-AI Collaboration**
+
+v3.0 brings a revolutionary architecture change with **Smart Daemons**, enabling parallel execution, cross-agent coordination, and enterprise-grade stability.
+
+<div align="center">
+
+![Parallel](https://img.shields.io/badge/Strategy-Parallel_Queue-blue?style=flat-square)
+![Stability](https://img.shields.io/badge/Daemon-Auto_Managed-green?style=flat-square)
+![Interruption](https://img.shields.io/badge/Gemini-Interruption_Aware-orange?style=flat-square)
+
+</div>
+
+<h3 align="center">✨ Key Features</h3>
+
+- **🔄 True Parallelism**: Submit multiple tasks to Codex, Gemini, or OpenCode simultaneously. The new daemons (`caskd`, `gaskd`, `oaskd`) automatically queue and execute them serially, ensuring no context pollution.
+- **🤝 Cross-AI Orchestration**: Claude and Codex can now simultaneously drive OpenCode agents. All requests are arbitrated by the unified daemon layer.
+- **🛡️ Bulletproof Stability**: Daemons are self-managing—they start automatically on the first request and shut down after 60s of idleness to save resources.
+- **⚡ Chained Execution**: Advanced workflows supported! Codex can autonomously call `oask` to delegate sub-tasks to OpenCode models.
+- **🛑 Smart Interruption**: Gemini tasks now support intelligent interruption detection, automatically handling stops and ensuring workflow continuity.
+
+<h3 align="center">🧩 Feature Support Matrix</h3>
+
+| Feature | `caskd` (Codex) | `gaskd` (Gemini) | `oaskd` (OpenCode) |
+| :--- | :---: | :---: | :---: |
+| **Parallel Queue** | ✅ | ✅ | ✅ |
+| **Interruption Awareness** | ✅ | ✅ | - |
+| **Response Isolation** | ✅ | ✅ | ✅ |
+
+<details>
+<summary><strong>📊 View Real-world Stress Test Results</strong></summary>
+
+<br>
+
+**Scenario 1: Claude & Codex Concurrent Access to OpenCode**
+*Both agents firing requests simultaneously, perfectly coordinated by the daemon.*
+
+| Source | Task | Result | Status |
+| :--- | :--- | :--- | :---: |
+| 🤖 Claude | `CLAUDE-A` | **CLAUDE-A** | 🟢 |
+| 🤖 Claude | `CLAUDE-B` | **CLAUDE-B** | 🟢 |
+| 💻 Codex | `CODEX-A` | **CODEX-A** | 🟢 |
+| 💻 Codex | `CODEX-B` | **CODEX-B** | 🟢 |
+
+**Scenario 2: Recursive/Chained Calls**
+*Codex autonomously driving OpenCode for a 5-step workflow.*
+
+| Request | Exit Code | Response |
+| :--- | :---: | :--- |
+| **ONE** | `0` | `CODEX-ONE` |
+| **TWO** | `0` | `CODEX-TWO` |
+| **THREE** | `0` | `CODEX-THREE` |
+| **FOUR** | `0` | `CODEX-FOUR` |
+| **FIVE** | `0` | `CODEX-FIVE` |
+
+</details>
+
+---
+
+<h3 align="center">🧠 Introducing CCA (Claude Code Autoflow)</h3>
+
+Unlock the full potential of `ccb` with **CCA** — an advanced workflow automation system built on top of this bridge.
+
+*   **Workflow Automation**: Intelligent task assignment and automated state management.
+*   **Seamless Integration**: Native support for the v3.0 daemon architecture.
+
+[👉 View Project on GitHub](https://github.com/bfly123/claude_code_autoflow)
+
+**Install via CCB:**
+```bash
+ccb update cca
+```
 
 ---
 
@@ -297,6 +373,13 @@ Once started, collaborate naturally. Claude will detect when to delegate tasks.
 
 <details>
 <summary><b>Version History</b></summary>
+
+### v3.0.0
+- **Smart Daemons**: `caskd`/`gaskd`/`oaskd` with 60s idle timeout & parallel queue support
+- **Cross-AI Collaboration**: Support multiple agents (Claude/Codex) calling one agent (OpenCode) simultaneously
+- **Interruption Detection**: Gemini now supports intelligent interruption handling
+- **Chained Execution**: Codex can call `oask` to drive OpenCode
+- **Stability**: Robust queue management and lock files
 
 ### v2.3.9
 - Fix oask session tracking bug - follow new session when OpenCode creates one

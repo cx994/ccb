@@ -7,7 +7,11 @@ If --output is provided, the reply is written atomically to that file and stdout
 """
 from __future__ import annotations
 
+import json
 import os
+import socket
+import shutil
+import subprocess
 import sys
 import time
 from pathlib import Path
@@ -21,72 +25,281 @@ from compat import setup_windows_encoding
 setup_windows_encoding()
 from process_lock import ProviderLock
 
-COMPLETION_MARKER = (os.environ.get("CCB_EXECUTION_COMPLETE_MARKER") or "EXECUTION_COMPLETE").strip() or "EXECUTION_COMPLETE"
+def _env_bool(name: str, default: bool) -> bool:
+    raw = os.environ.get(name)
+    if raw is None or raw == "":
+        return default
+    v = raw.strip().lower()
+    if v in ("0", "false", "no", "off"):
+        return False
+    if v in ("1", "true", "yes", "on"):
+        return True
+    return default
 
 
-def _has_completion_marker(text: str) -> bool:
-    """Check if last line contains COMPLETION_MARKER (flexible match)."""
-    lines = text.rstrip().splitlines()
-    return bool(lines) and COMPLETION_MARKER in lines[-1]
+def _oaskd_autostart_enabled(default: bool = True) -> bool:
+    # Prefer the new name; keep CCB_AUTO_OASKD for backwards compatibility.
+    if "CCB_OASKD_AUTOSTART" in os.environ:
+        return _env_bool("CCB_OASKD_AUTOSTART", default)
+    if "CCB_AUTO_OASKD" in os.environ:
+        return _env_bool("CCB_AUTO_OASKD", default)
+    return default
 
 
-def _strip_completion_marker(text: str) -> str:
-    """Remove the trailing marker line if it contains COMPLETION_MARKER."""
-    lines = text.rstrip().splitlines()
-    if lines and COMPLETION_MARKER in lines[-1]:
-        return "\n".join(lines[:-1]).rstrip()
-    return text.rstrip()
-
-
-def _wait_for_complete_reply(log_reader, state: dict, timeout: float, quiet: bool):
-    """Wait until reply ends with COMPLETION_MARKER or timeout."""
-    from cli_output import EXIT_NO_REPLY, EXIT_OK
-
-    # Pre-check: try to read existing messages (may have arrived before we started)
-    existing_reply = None
+def _state_file_from_env() -> Optional[Path]:
+    raw = (os.environ.get("CCB_OASKD_STATE_FILE") or "").strip()
+    if not raw:
+        return None
     try:
-        existing_reply, state = log_reader.wait_for_message(state, timeout=0.1)
-        if existing_reply and _has_completion_marker(existing_reply):
-            return _strip_completion_marker(existing_reply), EXIT_OK
+        return Path(raw).expanduser()
     except Exception:
-        pass
+        return None
+
+
+def _find_project_session_file(work_dir: Path) -> Optional[Path]:
+    current = Path(work_dir).resolve()
+    while True:
+        candidate = current / ".opencode-session"
+        if candidate.exists():
+            return candidate
+        if current == current.parent:
+            return None
+        current = current.parent
+
+
+def _try_daemon_request(work_dir: Path, message: str, timeout: float, quiet: bool) -> Optional[tuple[str, int]]:
+    if not _env_bool("CCB_OASKD", True):
+        return None
+
+    if not _find_project_session_file(work_dir):
+        return None
+
+    from oaskd_daemon import read_state
+
+    st = read_state(state_file=_state_file_from_env())
+    if not st:
+        return None
+    try:
+        host = st.get("connect_host") or st.get("host")
+        port = int(st["port"])
+        token = st["token"]
+    except Exception:
+        return None
+
+    try:
+        payload = {
+            "type": "oask.request",
+            "v": 1,
+            "id": f"oask-{os.getpid()}-{int(time.time() * 1000)}",
+            "token": token,
+            "work_dir": str(work_dir),
+            "timeout_s": float(timeout),
+            "quiet": bool(quiet),
+            "message": message,
+        }
+        connect_timeout = min(1.0, max(0.1, float(timeout)))
+        with socket.create_connection((host, port), timeout=connect_timeout) as sock:
+            sock.settimeout(0.5)
+            sock.sendall((json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8"))
+            buf = b""
+            deadline = time.time() + float(timeout) + 5.0
+            while b"\n" not in buf and time.time() < deadline:
+                try:
+                    chunk = sock.recv(65536)
+                except socket.timeout:
+                    continue
+                if not chunk:
+                    break
+                buf += chunk
+            if b"\n" not in buf:
+                return None
+            line = buf.split(b"\n", 1)[0].decode("utf-8", errors="replace")
+            resp = json.loads(line)
+            if resp.get("type") != "oask.response":
+                return None
+            reply = str(resp.get("reply") or "")
+            exit_code = int(resp.get("exit_code", 1))
+            return reply, exit_code
+    except Exception:
+        return None
+
+
+def _daemon_request_with_retries(work_dir: Path, message: str, timeout: float, quiet: bool) -> Optional[tuple[str, int]]:
+    """
+    Best-effort daemon request with retries to avoid autostart races.
+
+    Without this, a burst of concurrent `oask` invocations can fall back to direct mode
+    before the daemon is fully ready, causing only some requests to be submitted.
+    """
+    # Fast path
+    result = _try_daemon_request(work_dir, message, timeout, quiet)
+    if result is not None:
+        return result
+
+    # If daemon mode is disabled or no session, don't spin.
+    if not _env_bool("CCB_OASKD", True):
+        return None
+    if not _find_project_session_file(work_dir):
+        return None
+
+    # Stale state files can block daemon mode (e.g. daemon exited/crashed but the json remains).
+    state_file = _state_file_from_env()
+    if state_file and state_file.exists():
+        try:
+            from oaskd_daemon import ping_daemon
+
+            if not ping_daemon(timeout_s=0.2, state_file=state_file):
+                try:
+                    state_file.unlink()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    started = _maybe_start_oaskd()
+    if started:
+        _wait_for_oaskd_ready(timeout_s=_daemon_startup_wait_s(timeout))
+
+    # Retry briefly; re-reading state helps when multiple daemons were attempted.
+    wait_s = _daemon_retry_wait_s(timeout)
+    deadline = time.time() + min(3.0, max(0.2, float(timeout)))
+    while time.time() < deadline:
+        result = _try_daemon_request(work_dir, message, timeout, quiet)
+        if result is not None:
+            return result
+        time.sleep(wait_s)
+
+    return None
+
+
+def _maybe_start_oaskd() -> bool:
+    if not _env_bool("CCB_OASKD", True):
+        return False
+    if not _oaskd_autostart_enabled(True):
+        return False
+    if not _find_project_session_file(Path.cwd()):
+        return False
+
+    candidates: list[str] = []
+    local = (Path(__file__).resolve().parent / "oaskd")
+    if local.exists():
+        candidates.append(str(local))
+    found = shutil.which("oaskd")
+    if found:
+        candidates.append(found)
+    if not candidates:
+        return False
+
+    entry = candidates[0]
+    lower = entry.lower()
+    if lower.endswith((".cmd", ".bat", ".exe")):
+        argv = [entry]
+    else:
+        argv = [sys.executable, entry]
+    try:
+        kwargs = {"stdin": subprocess.DEVNULL, "stdout": subprocess.DEVNULL, "stderr": subprocess.DEVNULL, "close_fds": True}
+        if os.name == "nt":
+            kwargs["creationflags"] = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+        else:
+            kwargs["start_new_session"] = True
+        subprocess.Popen(argv, **kwargs)
+        return True
+    except Exception:
+        return False
+
+
+def _wait_for_oaskd_ready(timeout_s: float = 2.0) -> bool:
+    try:
+        from oaskd_daemon import ping_daemon
+    except Exception:
+        return False
+    deadline = time.time() + max(0.1, float(timeout_s))
+    state_file = _state_file_from_env()
+    while time.time() < deadline:
+        try:
+            if ping_daemon(timeout_s=0.2, state_file=state_file):
+                return True
+        except Exception:
+            pass
+        time.sleep(0.1)
+    return False
+
+
+def _daemon_startup_wait_s(timeout: float) -> float:
+    raw = (os.environ.get("CCB_OASKD_STARTUP_WAIT_S") or "").strip()
+    if raw:
+        try:
+            v = float(raw)
+        except Exception:
+            v = 0.0
+        if v > 0:
+            return min(max(0.2, v), max(0.2, float(timeout)))
+    # Default: allow a bit more time for concurrent first-start races.
+    return min(8.0, max(1.0, float(timeout)))
+
+
+def _daemon_retry_wait_s(timeout: float) -> float:
+    raw = (os.environ.get("CCB_OASKD_RETRY_WAIT_S") or "").strip()
+    if raw:
+        try:
+            v = float(raw)
+        except Exception:
+            v = 0.0
+        if v > 0:
+            return min(1.0, max(0.05, v))
+    return min(0.3, max(0.05, float(timeout) / 50.0))
+
+
+def _wait_for_done_reply(log_reader, state: dict, timeout: float, req_id: str, quiet: bool):
+    from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK
+    from oaskd_protocol import is_done_text, strip_done_text
 
     deadline = time.time() + timeout
-    chunks = []
-    if existing_reply:
-        chunks.append(existing_reply)
+    chunks: list[str] = []
+    cancel_enabled = _env_bool("CCB_OASKD_CANCEL_DETECT", False)
+    session_id = state.get("session_id") if cancel_enabled and isinstance(state.get("session_id"), str) else None
+    cancel_cursor = log_reader.open_cancel_log_cursor() if cancel_enabled and session_id else None
+    cancel_since_s = time.time() if cancel_enabled else 0.0
 
     while True:
         remaining = deadline - time.time()
         if remaining <= 0:
             break
-        reply, state = log_reader.wait_for_message(state, remaining)
+        reply, state = log_reader.wait_for_message(state, min(remaining, 1.0))
+
+        # Fallback cancellation detection via OpenCode server logs.
+        if cancel_enabled and session_id and cancel_cursor is not None:
+            try:
+                cancelled_log, cancel_cursor = log_reader.detect_cancel_event_in_logs(
+                    cancel_cursor, session_id=session_id, since_epoch_s=cancel_since_s
+                )
+                if cancelled_log:
+                    return "❌ OpenCode request cancelled.", EXIT_ERROR
+            except Exception:
+                pass
+
+        # OpenCode cancellation writes an assistant message with MessageAbortedError (no text parts).
+        #
+        # Important: do NOT advance the caller's state baseline when not cancelled (see oaskd_daemon).
+        if cancel_enabled:
+            try:
+                cancelled, _new_state = log_reader.detect_cancelled_since(state, req_id=req_id)
+                if cancelled:
+                    return "❌ OpenCode request cancelled.", EXIT_ERROR
+            except Exception:
+                pass
+
         if reply is None:
             continue
         chunks.append(reply)
-        if _has_completion_marker(reply):
-            combined = "\n".join(chunks)
-            return _strip_completion_marker(combined), EXIT_OK
-
-    if chunks:
-        if not quiet:
-            print("[WARN] Marker not detected, returning partial reply", file=sys.stderr)
         combined = "\n".join(chunks)
-        return _strip_completion_marker(combined), EXIT_NO_REPLY
-    return None, EXIT_NO_REPLY
+        if is_done_text(combined, req_id):
+            return strip_done_text(combined, req_id), EXIT_OK
 
-
-def _with_completion_marker_request(message: str) -> str:
-    if not message:
-        return message
-    if COMPLETION_MARKER in message:
-        return message
-    return (
-        f"{message}\n\n"
-        "IMPORTANT:\n"
-        "- You MUST reply with a final response (do not stay silent).\n"
-        f"- End your reply with this exact line (verbatim):\n{COMPLETION_MARKER}\n"
-    )
+    combined = "\n".join(chunks)
+    if combined and not quiet:
+        print("[WARN] Done marker not detected, returning partial reply", file=sys.stderr)
+    return strip_done_text(combined, req_id), EXIT_NO_REPLY
 
 
 def _usage() -> None:
@@ -151,6 +364,8 @@ def main(argv: list[str]) -> int:
     try:
         from cli_output import EXIT_ERROR, EXIT_NO_REPLY, EXIT_OK, atomic_write_text
         from opencode_comm import OpenCodeCommunicator
+        from opencode_comm import OpenCodeLogReader
+        from oaskd_protocol import make_req_id, wrap_opencode_prompt
 
         output_path, timeout, message, quiet = _parse_args(argv)
         if not message and not sys.stdin.isatty():
@@ -164,15 +379,50 @@ def main(argv: list[str]) -> int:
             print("Correct usage: Bash(oask \"...\", run_in_background=true)", file=sys.stderr)
             return EXIT_ERROR
 
+        # Prefer daemon mode: daemon performs per-session serialization and should accept concurrent submissions.
+        daemon_result = _daemon_request_with_retries(Path.cwd(), message, timeout, quiet)
+        if daemon_result is not None:
+            reply, exit_code = daemon_result
+            if output_path:
+                atomic_write_text(output_path, reply + "\n")
+                return exit_code
+            sys.stdout.write(reply)
+            if not reply.endswith("\n"):
+                sys.stdout.write("\n")
+            return exit_code
+
         comm = OpenCodeCommunicator(lazy_init=True)
         healthy, status = comm._check_session_health_impl(probe_terminal=False)
         if not healthy:
             raise RuntimeError(f"[ERROR] Session error: {status}")
 
-        # Use per-provider lock to serialize request-response cycles (non-blocking)
-        lock = ProviderLock("opencode")
-        if not lock.try_acquire():
-            print("[ERROR] Another oask request is in progress. Please wait and try again.", file=sys.stderr)
+        # Prefer the canonical session_key computation used by the daemon to avoid cross-mode
+        # serialization mismatches (e.g. if one caller sees marker while another doesn't).
+        try:
+            from oaskd_session import compute_session_key, load_project_session
+
+            session = load_project_session(Path.cwd())
+        except Exception:
+            session = None
+
+        if session:
+            session_key = compute_session_key(session)
+        else:
+            marker = str(comm.session_info.get("pane_title_marker") or "").strip()
+            if marker:
+                session_key = f"opencode_marker:{marker}"
+            elif comm.pane_id:
+                session_key = f"opencode_pane:{comm.pane_id}"
+            else:
+                sid = str(comm.session_info.get("session_id") or comm.session_id or "").strip()
+                if sid:
+                    session_key = f"opencode:{sid}"
+                else:
+                    session_key = f"opencode_file:{comm.project_session_file or os.getcwd()}"
+
+        lock = ProviderLock("opencode", cwd=f"session:{session_key}", timeout=min(300.0, max(1.0, float(timeout))))
+        if not lock.acquire():
+            print("[ERROR] Another oask request is in progress (lock timeout).", file=sys.stderr)
             return EXIT_ERROR
 
         try:
@@ -180,11 +430,12 @@ def main(argv: list[str]) -> int:
             if output_path and output_path.exists():
                 output_path.write_text("")
 
-            # Reset log state to ignore any messages before lock acquisition
-            comm.log_reader.capture_state()
+            req_id = make_req_id()
+            log_reader = OpenCodeLogReader(work_dir=Path.cwd(), session_id_filter=(comm.session_id or None))
+            state = log_reader.capture_state()
+            comm._send_via_terminal(wrap_opencode_prompt(message, req_id))
 
-            _, state = comm._send_message(_with_completion_marker_request(message))
-            reply, exit_code = _wait_for_complete_reply(comm.log_reader, state, timeout, quiet)
+            reply, exit_code = _wait_for_done_reply(log_reader, state, timeout, req_id, quiet)
             if reply is None:
                 if not quiet:
                     print(f"[TIMEOUT] Timeout after {int(timeout)}s", file=sys.stderr)

@@ -8,6 +8,7 @@ tests/
 .gemini-session
 .claude-session
 .opencode-session
+opencode.json
 .claude/
 *.mp4
 tmp/

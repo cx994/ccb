@@ -544,6 +544,10 @@ class CaskdServer:
 
         class Handler(socketserver.StreamRequestHandler):
             def handle(self) -> None:
+                with self.server.activity_lock:
+                    self.server.active_requests += 1
+                    self.server.last_activity = time.time()
+
                 try:
                     line = self.rfile.readline()
                     if not line:
@@ -614,8 +618,25 @@ class CaskdServer:
                     data = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
                     self.wfile.write(data)
                     self.wfile.flush()
+                    try:
+                        with self.server.activity_lock:
+                            self.server.last_activity = time.time()
+                    except Exception:
+                        pass
                 except Exception:
                     pass
+
+            def finish(self) -> None:
+                try:
+                    super().finish()
+                finally:
+                    try:
+                        with self.server.activity_lock:
+                            if self.server.active_requests > 0:
+                                self.server.active_requests -= 1
+                            self.server.last_activity = time.time()
+                    except Exception:
+                        pass
 
         class Server(socketserver.ThreadingTCPServer):
             allow_reuse_address = True
@@ -623,6 +644,34 @@ class CaskdServer:
         with Server((self.host, self.port), Handler) as httpd:
             httpd.token = self.token
             httpd.pool = self.pool
+            httpd.active_requests = 0
+            httpd.last_activity = time.time()
+            httpd.activity_lock = threading.Lock()
+            try:
+                httpd.idle_timeout_s = float(os.environ.get("CCB_CASKD_IDLE_TIMEOUT_S", "60") or "60")
+            except Exception:
+                httpd.idle_timeout_s = 60.0
+
+            def _idle_monitor() -> None:
+                timeout_s = float(getattr(httpd, "idle_timeout_s", 60.0) or 0.0)
+                if timeout_s <= 0:
+                    return
+                while True:
+                    time.sleep(0.5)
+                    try:
+                        with httpd.activity_lock:
+                            active = int(httpd.active_requests or 0)
+                            last = float(httpd.last_activity or time.time())
+                    except Exception:
+                        active = 0
+                        last = time.time()
+                    if active == 0 and (time.time() - last) >= timeout_s:
+                        _write_log(f"[INFO] caskd idle timeout ({int(timeout_s)}s) reached; shutting down")
+                        threading.Thread(target=httpd.shutdown, daemon=True).start()
+                        return
+
+            threading.Thread(target=_idle_monitor, daemon=True).start()
+
             actual_host, actual_port = httpd.server_address
             self._write_state(actual_host, int(actual_port))
             _write_log(f"[INFO] caskd started pid={os.getpid()} addr={actual_host}:{actual_port}")

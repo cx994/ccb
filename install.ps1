@@ -28,8 +28,8 @@ $script:CCB_END_MARKER = "<!-- CCB_CONFIG_END -->"
 $script:SCRIPTS_TO_LINK = @(
   "ccb",
   "cask", "cask-w", "caskd", "cpend", "cping",
-  "gask", "gask-w", "gpend", "gping",
-  "oask", "oask-w", "opend", "oping",
+  "gask", "gask-w", "gaskd", "gpend", "gping",
+  "oask", "oask-w", "oaskd", "opend", "oping",
   "ccb-layout"
 )
 
@@ -230,9 +230,9 @@ function Install-Native {
 
   $scripts = @(
     "ccb",
-    "cask", "cask-w", "cping", "cpend",
-    "gask", "gask-w", "gping", "gpend",
-    "oask", "oask-w", "oping", "opend",
+    "cask", "cask-w", "caskd", "cping", "cpend",
+    "gask", "gask-w", "gaskd", "gping", "gpend",
+    "oask", "oask-w", "oaskd", "oping", "opend",
     "ccb-layout"
   )
 
