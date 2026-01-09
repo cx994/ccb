@@ -637,16 +637,13 @@ class CodexCommunicator:
                 return True, "Session healthy"
 
             # tmux mode: relies on wrapper to write codex.pid and FIFO
-            codex_pid_file = self.runtime_dir / "codex.pid"
-            if not codex_pid_file.exists():
-                return False, "Codex process PID file not found"
-
-            with open(codex_pid_file, "r", encoding="utf-8") as f:
-                codex_pid = int(f.read().strip())
-            try:
-                os.kill(codex_pid, 0)
-            except OSError:
-                return False, f"Codex process (PID:{codex_pid}) has exited"
+            # tmux mode: Codex runs inside a tmux session; PID file is best-effort and can be stale.
+            # Prefer terminal liveness + bridge liveness + FIFO presence.
+            if probe_terminal:
+                if not self.pane_id:
+                    return False, "tmux session not found"
+                if self.backend and (not self.backend.is_alive(self.pane_id)):
+                    return False, f"tmux session does not exist: {self.pane_id}"
 
             bridge_pid_file = self.runtime_dir / "bridge.pid"
             if not bridge_pid_file.exists():
