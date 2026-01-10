@@ -747,44 +747,63 @@ remove_codex_mcp() {
 
   local has_codex_mcp
   has_codex_mcp=$("$PYTHON_BIN" -c "
-	import json
-	try:
-	    with open('$claude_config', 'r') as f:
+import json
+
+try:
+    with open('$claude_config', 'r', encoding='utf-8') as f:
         data = json.load(f)
+    projects = data.get('projects', {}) if isinstance(data, dict) else {}
     found = False
-    for proj, cfg in data.get('projects', {}).items():
-        servers = cfg.get('mcpServers', {})
-        for name in list(servers.keys()):
-            if 'codex' in name.lower():
-                found = True
+    if isinstance(projects, dict):
+        for _proj, cfg in projects.items():
+            if not isinstance(cfg, dict):
+                continue
+            servers = cfg.get('mcpServers', {})
+            if not isinstance(servers, dict):
+                continue
+            for name in list(servers.keys()):
+                if 'codex' in str(name).lower():
+                    found = True
+                    break
+            if found:
                 break
-        if found:
-            break
     print('yes' if found else 'no')
-	except:
-	    print('no')
-	" 2>/dev/null)
+except Exception:
+    print('no')
+" 2>/dev/null)
 
   if [[ "$has_codex_mcp" == "yes" ]]; then
     echo "WARN: Detected codex-related MCP configuration, removing to avoid conflicts..."
     "$PYTHON_BIN" -c "
-	import json
-	with open('$claude_config', 'r') as f:
-	    data = json.load(f)
-removed = []
-for proj, cfg in data.get('projects', {}).items():
-    servers = cfg.get('mcpServers', {})
-    for name in list(servers.keys()):
-        if 'codex' in name.lower():
-            del servers[name]
-            removed.append(f'{proj}: {name}')
-with open('$claude_config', 'w') as f:
-    json.dump(data, f, indent=2)
-if removed:
-    print('Removed the following MCP configurations:')
-	    for r in removed:
-	        print(f'  - {r}')
-	"
+import json
+import sys
+
+try:
+    with open('$claude_config', 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    removed = []
+    projects = data.get('projects', {}) if isinstance(data, dict) else {}
+    if isinstance(projects, dict):
+        for proj, cfg in projects.items():
+            if not isinstance(cfg, dict):
+                continue
+            servers = cfg.get('mcpServers')
+            if not isinstance(servers, dict):
+                continue
+            for name in list(servers.keys()):
+                if 'codex' in str(name).lower():
+                    del servers[name]
+                    removed.append(f'{proj}: {name}')
+    with open('$claude_config', 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+    if removed:
+        print('Removed the following MCP configurations:')
+        for r in removed:
+            print(f'  - {r}')
+except Exception as e:
+    sys.stderr.write(f'WARN: failed cleaning MCP config: {e}\\n')
+    sys.exit(0)
+"
     echo "OK: Codex MCP configuration cleaned"
   fi
 }
@@ -844,35 +863,37 @@ AI_RULES
     if grep -q "$CCB_START_MARKER" "$claude_md" 2>/dev/null; then
       echo "Updating existing CCB config block..."
       "$PYTHON_BIN" -c "
-	import re
-	with open('$claude_md', 'r', encoding='utf-8') as f:
-	    content = f.read()
+import re
+
+with open('$claude_md', 'r', encoding='utf-8') as f:
+    content = f.read()
 pattern = r'<!-- CCB_CONFIG_START -->.*?<!-- CCB_CONFIG_END -->'
 new_block = '''$ccb_content'''
 content = re.sub(pattern, new_block, content, flags=re.DOTALL)
-	with open('$claude_md', 'w', encoding='utf-8') as f:
-	    f.write(content)
-	"
+with open('$claude_md', 'w', encoding='utf-8') as f:
+    f.write(content)
+"
     elif grep -qE "$LEGACY_RULE_MARKER|## Codex Collaboration Rules|## Gemini|## OpenCode" "$claude_md" 2>/dev/null; then
       echo "Removing legacy rules and adding new CCB config block..."
       "$PYTHON_BIN" -c "
-	import re
-	with open('$claude_md', 'r', encoding='utf-8') as f:
-	    content = f.read()
+import re
+
+with open('$claude_md', 'r', encoding='utf-8') as f:
+    content = f.read()
 patterns = [
-    r'## Codex Collaboration Rules.*?(?=\n## (?!Gemini)|\Z)',
-    r'## Codex 协作规则.*?(?=\n## |\Z)',
-    r'## Gemini Collaboration Rules.*?(?=\n## |\Z)',
-    r'## Gemini 协作规则.*?(?=\n## |\Z)',
-    r'## OpenCode Collaboration Rules.*?(?=\n## |\Z)',
-    r'## OpenCode 协作规则.*?(?=\n## |\Z)',
+    r'## Codex Collaboration Rules.*?(?=\\n## (?!Gemini)|\\Z)',
+    r'## Codex 协作规则.*?(?=\\n## |\\Z)',
+    r'## Gemini Collaboration Rules.*?(?=\\n## |\\Z)',
+    r'## Gemini 协作规则.*?(?=\\n## |\\Z)',
+    r'## OpenCode Collaboration Rules.*?(?=\\n## |\\Z)',
+    r'## OpenCode 协作规则.*?(?=\\n## |\\Z)',
 ]
 for p in patterns:
     content = re.sub(p, '', content, flags=re.DOTALL)
-content = content.rstrip() + '\n'
-	with open('$claude_md', 'w', encoding='utf-8') as f:
-	    f.write(content)
-	"
+content = content.rstrip() + '\\n'
+with open('$claude_md', 'w', encoding='utf-8') as f:
+    f.write(content)
+"
       echo "$ccb_content" >> "$claude_md"
     else
       echo "$ccb_content" >> "$claude_md"
@@ -934,18 +955,32 @@ SETTINGS
     if ! grep -q "$perm" "$settings_file" 2>/dev/null; then
       if pick_python_bin; then
         "$PYTHON_BIN" -c "
-	import json, sys
-	with open('$settings_file', 'r') as f:
-	    data = json.load(f)
-	if 'permissions' not in data:
-    data['permissions'] = {'allow': [], 'deny': []}
-if 'allow' not in data['permissions']:
-    data['permissions']['allow'] = []
-if '$perm' not in data['permissions']['allow']:
-    data['permissions']['allow'].append('$perm')
-	with open('$settings_file', 'w') as f:
-	    json.dump(data, f, indent=2)
-	"
+import json
+import sys
+
+path = '$settings_file'
+perm = '$perm'
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        data = {}
+    perms = data.get('permissions')
+    if not isinstance(perms, dict):
+        perms = {'allow': [], 'deny': []}
+        data['permissions'] = perms
+    allow = perms.get('allow')
+    if not isinstance(allow, list):
+        allow = []
+        perms['allow'] = allow
+    if perm not in allow:
+        allow.append(perm)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+except Exception as e:
+    sys.stderr.write(f'WARN: failed updating {path}: {e}\\n')
+    sys.exit(0)
+"
         added=1
       fi
     fi
@@ -1005,15 +1040,16 @@ uninstall_claude_md_config() {
     echo "Removing CCB config block from CLAUDE.md..."
     if pick_any_python_bin; then
       "$PYTHON_BIN" -c "
-	import re
-	with open('$claude_md', 'r', encoding='utf-8') as f:
-	    content = f.read()
-pattern = r'\n?<!-- CCB_CONFIG_START -->.*?<!-- CCB_CONFIG_END -->\n?'
-content = re.sub(pattern, '\n', content, flags=re.DOTALL)
-content = content.strip() + '\n'
-	with open('$claude_md', 'w', encoding='utf-8') as f:
-	    f.write(content)
-	"
+import re
+
+with open('$claude_md', 'r', encoding='utf-8') as f:
+    content = f.read()
+pattern = r'\\n?<!-- CCB_CONFIG_START -->.*?<!-- CCB_CONFIG_END -->\\n?'
+content = re.sub(pattern, '\\n', content, flags=re.DOTALL)
+content = content.strip() + '\\n'
+with open('$claude_md', 'w', encoding='utf-8') as f:
+    f.write(content)
+"
       echo "Removed CCB config from CLAUDE.md"
     else
       echo "WARN: python required to clean CLAUDE.md, please manually remove CCB_CONFIG block"
@@ -1022,23 +1058,24 @@ content = content.strip() + '\n'
     echo "Removing legacy collaboration rules from CLAUDE.md..."
     if pick_any_python_bin; then
       "$PYTHON_BIN" -c "
-	import re
-	with open('$claude_md', 'r', encoding='utf-8') as f:
-	    content = f.read()
+import re
+
+with open('$claude_md', 'r', encoding='utf-8') as f:
+    content = f.read()
 patterns = [
-    r'## Codex Collaboration Rules.*?(?=\n## (?!Gemini)|\Z)',
-    r'## Codex 协作规则.*?(?=\n## |\Z)',
-    r'## Gemini Collaboration Rules.*?(?=\n## |\Z)',
-    r'## Gemini 协作规则.*?(?=\n## |\Z)',
-    r'## OpenCode Collaboration Rules.*?(?=\n## |\Z)',
-    r'## OpenCode 协作规则.*?(?=\n## |\Z)',
+    r'## Codex Collaboration Rules.*?(?=\\n## (?!Gemini)|\\Z)',
+    r'## Codex 协作规则.*?(?=\\n## |\\Z)',
+    r'## Gemini Collaboration Rules.*?(?=\\n## |\\Z)',
+    r'## Gemini 协作规则.*?(?=\\n## |\\Z)',
+    r'## OpenCode Collaboration Rules.*?(?=\\n## |\\Z)',
+    r'## OpenCode 协作规则.*?(?=\\n## |\\Z)',
 ]
 for p in patterns:
     content = re.sub(p, '', content, flags=re.DOTALL)
-content = content.rstrip() + '\n'
-	with open('$claude_md', 'w', encoding='utf-8') as f:
-	    f.write(content)
-	"
+content = content.rstrip() + '\\n'
+with open('$claude_md', 'w', encoding='utf-8') as f:
+    f.write(content)
+"
       echo "Removed collaboration rules from CLAUDE.md"
     else
       echo "WARN: python required to clean CLAUDE.md, please manually remove collaboration rules"
@@ -1080,9 +1117,12 @@ uninstall_settings_permissions() {
     if [[ $has_perms -eq 1 ]]; then
       echo "Removing permission configuration from settings.json..."
       "$PYTHON_BIN" -c "
-	import json
-	perms_to_remove = [
-	    'Bash(cask:*)',
+import json
+import sys
+
+path = '$settings_file'
+perms_to_remove = [
+    'Bash(cask:*)',
     'Bash(cask-w:*)',
     'Bash(cpend)',
     'Bash(cping)',
@@ -1095,16 +1135,23 @@ uninstall_settings_permissions() {
     'Bash(opend)',
     'Bash(oping)',
 ]
-with open('$settings_file', 'r') as f:
-    data = json.load(f)
-if 'permissions' in data and 'allow' in data['permissions']:
-    data['permissions']['allow'] = [
-        p for p in data['permissions']['allow']
-        if p not in perms_to_remove
-    ]
-	with open('$settings_file', 'w') as f:
-	    json.dump(data, f, indent=2)
-	"
+try:
+    with open(path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+    if not isinstance(data, dict):
+        sys.exit(0)
+    perms = data.get('permissions')
+    if not isinstance(perms, dict):
+        sys.exit(0)
+    allow = perms.get('allow')
+    if not isinstance(allow, list):
+        sys.exit(0)
+    perms['allow'] = [p for p in allow if p not in perms_to_remove]
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=2)
+except Exception:
+    sys.exit(0)
+"
       echo "Removed permission configuration from settings.json"
     fi
   else
